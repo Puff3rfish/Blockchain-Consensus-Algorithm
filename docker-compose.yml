@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  nodeA:
+    build: .
+    command: python blockchain_node.py --host 0.0.0.0 --port 5000 --id node-A
+    ports:
+      - "5000:5000"
+
+  nodeB:
+    build: .
+    command: python blockchain_node.py --host 0.0.0.0 --port 5001 --id node-B
+    ports:
+      - "5001:5001"
+
+  nodeC:
+    build: .
+    command: python blockchain_node.py --host 0.0.0.0 --port 5002 --id node-C
+    ports:
+      - "5002:5002"
+
+  nodeD:
+    build: .
+    command: python blockchain_node.py --host 0.0.0.0 --port 5003 --id node-D
+    ports:
+      - "5003:5003"
+
+  nodeE:
+    build: .
+    command: python blockchain_node.py --host 0.0.0.0 --port 5004 --id node-E
+    ports:
+      - "5004:5004"
+
+  # one-shot bootstrapper to interconnect nodes
+  bootstrap:
+    build: .
+    command: python register_peers.py
+    depends_on:
+      - nodeA
+      - nodeB
+      - nodeC
+      - nodeD
+      - nodeE
+    restart: "no"
+
+  gateway:
+    build: .
+    command: uvicorn gateway:app --host 0.0.0.0 --port 8080
+    environment:
+      # internal URLs reachable via Docker DNS
+      NODE_URLS: "http://nodeA:5000,http://nodeB:5001,http://nodeC:5002,http://nodeD:5003,http://nodeE:5004"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - nodeA
+      - nodeB
+      - nodeC
+      - nodeD
+      - nodeE
+
+  indexer:
+    build: .
+    command: python indexer.py
+    environment:
+      GATEWAY: "http://gateway:8080"
+      DB_PATH: "/data/chain_index.db"
+      POLL_SECS: "3"
+    volumes:
+      - ./data:/data
+    depends_on:
+      - gateway
