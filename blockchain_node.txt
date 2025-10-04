@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import time
+import argparse
+import threading
+from dataclasses import dataclass, field
+from typing import List, Set, Optional, Dict, Any
+from urllib.parse import urlparse
+
+import requests
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+@dataclass
+class Block:
+    index: int
+    timestamp: float
+    transactions: List[Dict[str, Any]]
+    proof: int
+    previous_hash: str
+
+class Blockchain:
+    def __init__(self, node_id: str):
+        self.current_transactions: List[Dict[str, Any]] = []
+        self.chain: List[Block] = []
+        self.nodes: Set[str] = set()
+        self.node_id = node_id
+        self._lock = threading.Lock()
+
+        # Create the genesis block
+        self.new_block(proof=100, previous_hash="1")
+
+    # --- Core blockchain ops ---
+
+    def new_block(self, proof: int, previous_hash: Optional[str]=None) -> Block:
+        with self._lock:
+            block = Block(
+                index=len(self.chain) + 1,
+                timestamp=time.time(),
+                transactions=self.current_transactions.copy(),
+                proof=proof,
+                previous_hash=previous_hash or self.hash_block(self.chain[-1]),
+            )
+            # Reset the current list of transactions
+            self.current_transactions = []
+            self.chain.append(block)
+        return block
+
+    def new_transaction(self, sender: str, recipient: str, amount: float) -> int:
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        with self._lock:
+            self.current_transactions.append({
+                'sender': sender,
+                'recipient': recipient,
+                'amount': amount,
+            })
+            return self.last_block.index + 1
+
+    @staticmethod
+    def hash_block(block: Block) -> str:
+        # Ensure deterministic JSON
+        block_dict = {
+            "index": block.index,
+            "timestamp": block.timestamp,
+            "transactions": block.transactions,
+            "proof": block.proof,
+            "previous_hash": block.previous_hash
+        }
+        block_string = json.dumps(block_dict, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    @property
+    def last_block(self) -> Block:
+        return self.chain[-1]
+
+    # --- Proof of Work (toy) ---
+
+    def proof_of_work(self, last_proof: int, last_hash: str) -> int:
+        proof = 0
+        while not self.valid_proof(last_proof, proof, last_hash):
+            proof += 1
+        return proof
+
+    @staticmethod
+    def valid_proof(last_proof: int, proof: int, last_hash: str) -> bool:
+        guess = f'{last_proof}{proof}{last_hash}'.encode()
+        guess_hash = hashlib.sha256(guess).hexdigest()
+        # Adjust difficulty (e.g., 4 leading zeros). Increase for more work.
+        return guess_hash[:4] == "0000"
+
+    # --- Networking & consensus ---
+
+    def register_node(self, address: str) -> None:
+        """
+        Add a new node by URL like: http://192.168.1.23:5001
+        """
+        parsed = urlparse(address)
+        if not parsed.scheme:
+            # allow bare host:port
+            address = f"http://{address}"
+            parsed = urlparse(address)
+        if not parsed.netloc:
+            raise ValueError("Invalid node address")
+        self.nodes.add(f"{parsed.scheme}://{parsed.netloc}")
+
+    def valid_chain(self, chain: List[Dict[str, Any]]) -> bool:
+        # Verify blocks link and proofs are valid
+        if not chain:
+            return False
+        # Basic structure check
+        for b in chain:
+            for k in ("index", "timestamp", "transactions", "proof", "previous_hash"):
+                if k not in b:
+                    return False
+
+        last_block = chain[0]
+        current_index = 1
+
+        while current_index < len(chain):
+            block = chain[current_index]
+
+            # Check linking hash
+            last_hash = self._hash_block_like_api(last_block)
+            if block['previous_hash'] != last_hash:
+                return False
+
+            # Check PoW
+            if not self.valid_proof(last_block['proof'], block['proof'], last_hash):
+                return False
+
+            last_block = block
+            current_index += 1
+        return True
+
+    def resolve_conflicts(self) -> bool:
+        """
+        Consensus: Replace our chain with the longest valid one in the network.
+        """
+        neighbors = list(self.nodes)
+        new_chain: Optional[List[Dict[str, Any]]] = None
+        max_length = len(self.chain)
+
+        for node in neighbors:
+            try:
+                r = requests.get(f"{node}/chain", timeout=5)
+                if r.status_code != 200:
+                    continue
+                resp = r.json()
+                length = resp.get("length")
+                chain = resp.get("chain")
+
+                if not isinstance(length, int) or not isinstance(chain, list):
+                    continue
+
+                if length > max_length and self.valid_chain(chain):
+                    max_length = length
+                    new_chain = chain
+            except requests.RequestException:
+                continue
+
+        if new_chain:
+            with self._lock:
+                # Convert dicts to Block objects
+                new_blocks: List[Block] = []
+                for b in new_chain:
+                    new_blocks.append(Block(
+                        index=b["index"],
+                        timestamp=b["timestamp"],
+                        transactions=b["transactions"],
+                        proof=b["proof"],
+                        previous_hash=b["previous_hash"]
+                    ))
+                self.chain = new_blocks
+            return True
+
+        return False
+
+    @staticmethod
+    def _hash_block_like_api(block_dict: Dict[str, Any]) -> str:
+        # Used to validate external chains that arrive as dicts
+        block_string = json.dumps({
+            "index": block_dict["index"],
+            "timestamp": block_dict["timestamp"],
+            "transactions": block_dict["transactions"],
+            "proof": block_dict["proof"],
+            "previous_hash": block_dict["previous_hash"],
+        }, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+# --- Flask routes ---
+
+NODE: Optional[Blockchain] = None
+
+@app.get("/id")
+def get_id():
+    return jsonify({"node_id": NODE.node_id})
+
+@app.get("/ping")
+def ping():
+    return jsonify({"ok": True, "node_id": NODE.node_id, "peers": list(NODE.nodes)})
+
+@app.get("/mine")
+def mine():
+    last_block = NODE.last_block
+    last_hash = NODE.hash_block(last_block)
+    proof = NODE.proof_of_work(last_block.proof, last_hash)
+
+    # Reward the miner with a transaction from "0" (signifies new coin)
+    try:
+        NODE.new_transaction(sender="0", recipient=NODE.node_id, amount=1.0)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    block = NODE.new_block(proof, previous_hash=last_hash)
+    return jsonify({
+        "message": "New block forged",
+        "index": block.index,
+        "transactions": block.transactions,
+        "proof": block.proof,
+        "previous_hash": block.previous_hash,
+        "chain_length": len(NODE.chain),
+    }), 201
+
+@app.post("/transactions/new")
+def new_transaction():
+    values = request.get_json(force=True, silent=True) or {}
+    required = ['sender', 'recipient', 'amount']
+    if not all(k in values for k in required):
+        return jsonify({'error': 'Missing fields'}), 400
+    try:
+        index = NODE.new_transaction(values['sender'], values['recipient'], float(values['amount']))
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid amount'}), 400
+    return jsonify({'message': f'Transaction will be added to Block {index}'}), 201
+
+@app.get("/chain")
+def full_chain():
+    return jsonify({
+        'chain': [block.__dict__ for block in NODE.chain],
+        'length': len(NODE.chain),
+    }), 200
+
+@app.post("/nodes/register")
+def register_nodes():
+    """
+    Body: {"nodes": ["http://IP_A:5000", "http://IP_B:5001", ...]}
+    You can also pass bare "IP:PORT" and it will auto-add http://
+    """
+    values = request.get_json(force=True, silent=True) or {}
+    nodes = values.get('nodes')
+    if nodes is None or not isinstance(nodes, list) or not nodes:
+        return jsonify({'error': 'Please supply a JSON list of node URLs'}), 400
+
+    added = []
+    for node in nodes:
+        try:
+            NODE.register_node(node)
+            added.append(node)
+        except ValueError:
+            continue
+
+    return jsonify({'message': 'New nodes have been added', 'total_nodes': list(NODE.nodes), 'added': added}), 201
+
+@app.get("/nodes")
+def list_nodes():
+    return jsonify({'nodes': list(NODE.nodes), 'count': len(NODE.nodes)})
+
+@app.get("/nodes/resolve")
+def consensus():
+    replaced = NODE.resolve_conflicts()
+    return jsonify({
+        'message': 'Our chain was replaced' if replaced else 'Our chain is authoritative',
+        'chain': [b.__dict__ for b in NODE.chain],
+        'length': len(NODE.chain),
+    })
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Minimal Python blockchain node (HTTP).")
+    p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    p.add_argument("--port", type=int, default=5000, help="Bind port (default: 5000)")
+    p.add_argument("--id", dest="node_id", default=None, help="Human-friendly node id (default: host:port)")
+    return p.parse_args()
+
+def main():
+    global NODE
+    args = parse_args()
+    node_id = args.node_id or f"{args.host}:{args.port}"
+    NODE = Blockchain(node_id=node_id)
+    # Turn off reloader to avoid double threads for PoW route
+    app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=True)
+
+if __name__ == "__main__":
+    main()
